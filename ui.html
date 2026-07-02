@@ -1,0 +1,246 @@
+<!doctype html>
+<html>
+<head>
+  <script>
+    try { window.localStorage.getItem('x') } catch (e) {
+      const store = new Map()
+      const shim = { getItem: k => store.has(k) ? store.get(k) : null, setItem: (k,v) => { store.set(k,String(v)) }, removeItem: k => { store.delete(k) }, clear: () => { store.clear() }, key: i => Array.from(store.keys())[i] ?? null, get length() { return store.size } }
+      Object.defineProperty(window, 'localStorage', { value: shim, configurable: true })
+    }
+  </script>
+  <style>
+    html, body { margin: 0; padding: 0; height: auto; min-height: 0; }
+    #plugin-root { height: auto; }
+    body { display: block; }
+    dialog.fig-fill-picker-dialog { width: 300px; max-width: 300px; min-width: 300px; max-height: none; height: max-content; }
+    .state-msg { padding: var(--spacer-2) var(--spacer-3); color: var(--figma-color-text-secondary); font-family: var(--font-family); font-size: var(--body-medium-fontSize); text-align: center; }
+    .loading-msg { padding: var(--spacer-2) var(--spacer-3); color: var(--figma-color-text-secondary); font-family: var(--font-family); font-size: var(--body-medium-fontSize); text-align: center; font-style: italic; }
+    .color-row { display: flex; align-items: center; gap: var(--spacer-2); padding: 3px var(--spacer-3); }
+    .orig-swatch { width: 24px; height: 24px; border-radius: 4px; border: 1px solid var(--figma-color-border); flex-shrink: 0; }
+    .arrow { color: var(--figma-color-text-secondary); font-size: 12px; flex-shrink: 0; font-family: var(--font-family); }
+    .color-row fig-input-color { flex: 1; }
+  </style>
+</head>
+<body>
+<div id="plugin-root">
+  <fig-content id="main-content">
+    <div class="state-msg">Select a layer to scan its colors.</div>
+  </fig-content>
+  <fig-footer id="footer" style="display:none">
+    <fig-button id="apply-btn" type="submit" disabled>Apply colors</fig-button>
+  </fig-footer>
+</div>
+<script>
+function quantizeColors(pixelDataList, maxColors) {
+  const buckets = new Map()
+  for (const data of pixelDataList) {
+    for (let i = 0; i < data.length; i += 4) {
+      const a = data[i + 3]
+      if (a < 30) continue
+      const r = data[i] >> 3
+      const g = data[i + 1] >> 3
+      const b = data[i + 2] >> 3
+      const key = (r << 10) | (g << 5) | b
+      buckets.set(key, (buckets.get(key) || 0) + 1)
+    }
+  }
+  const sorted = Array.from(buckets.entries()).sort(function(a, b) { return b[1] - a[1] })
+  const kept = []
+  outer: for (const [key, count] of sorted) {
+    const r = ((key >> 10) & 0x1f) << 3
+    const g = ((key >> 5) & 0x1f) << 3
+    const b = (key & 0x1f) << 3
+    for (const prev of kept) {
+      const dr = r - prev.r, dg = g - prev.g, db = b - prev.b
+      if (Math.sqrt(dr*dr + dg*dg + db*db) < 30) continue outer
+    }
+    kept.push({ r, g, b, count })
+    if (kept.length >= maxColors) break
+  }
+  return kept
+}
+function toHex(r, g, b) {
+  return '#' + [r, g, b].map(v => v.toString(16).padStart(2, '0').toUpperCase()).join('')
+}
+function hexToRgb(hex) {
+  const h = hex.replace('#', '')
+  return { r: parseInt(h.slice(0,2),16), g: parseInt(h.slice(2,4),16), b: parseInt(h.slice(4,6),16) }
+}
+function colorDist(r1,g1,b1,r2,g2,b2) {
+  return Math.sqrt((r1-r2)**2+(g1-g2)**2+(b1-b2)**2)
+}
+let solidEntries = []
+let imageEntries = []
+let loadedImages = []
+let lastH = 0, raf = 0
+function measureH() {
+  const root = document.getElementById('plugin-root')
+  if (!root) return 0
+  let h = Math.ceil(root.getBoundingClientRect().height)
+  const d = document.querySelector('dialog.fig-fill-picker-dialog[open]')
+  if (d) h = Math.max(h, Math.ceil(d.getBoundingClientRect().bottom))
+  return h
+}
+function reportH() { const h = measureH(); if (h && h !== lastH) { lastH = h; parent.postMessage({ pluginMessage: { type: 'resize', height: h } }, '*') } }
+const root$ = document.getElementById('plugin-root')
+if (root$ && typeof ResizeObserver !== 'undefined') new ResizeObserver(() => { if (raf) cancelAnimationFrame(raf); raf = requestAnimationFrame(reportH) }).observe(root$)
+new MutationObserver(() => { if (raf) cancelAnimationFrame(raf); raf = requestAnimationFrame(reportH) }).observe(document.body, { childList: true, attributes: true, attributeFilter: ['open'], subtree: true })
+function showMessage(msg) {
+  document.getElementById('main-content').innerHTML = '<div class="state-msg">' + msg + '</div>'
+  document.getElementById('footer').style.display = 'none'
+}
+function showLoading(msg) {
+  document.getElementById('main-content').innerHTML = '<div class="loading-msg">' + msg + '</div>'
+  document.getElementById('footer').style.display = 'none'
+}
+function buildColorRow(hex, index, entries) {
+  const row = document.createElement('div')
+  row.className = 'color-row'
+  const swatch = document.createElement('div')
+  swatch.className = 'orig-swatch'
+  swatch.style.background = hex
+  swatch.title = hex.toLowerCase()
+  const arrow = document.createElement('span')
+  arrow.className = 'arrow'
+  arrow.textContent = '→'
+  const picker = document.createElement('fig-input-color')
+  picker.setAttribute('picker', 'figma-native')
+  picker.setAttribute('alpha', 'false')
+  picker.setAttribute('value', hex)
+  picker.setAttribute('full', '')
+  const update = e => {
+    const val = (e.detail && e.detail.value) ? e.detail.value : picker.value
+    entries[index].current = val.startsWith('#') ? val.toUpperCase() : ('#' + val.toUpperCase())
+    checkChanged()
+  }
+  picker.addEventListener('change', update)
+  picker.addEventListener('input', update)
+  row.appendChild(swatch)
+  row.appendChild(arrow)
+  row.appendChild(picker)
+  return row
+}
+function renderAll() {
+  const content = document.getElementById('main-content')
+  content.innerHTML = ''
+  if (solidEntries.length > 0) {
+    const g = document.createElement('fig-group')
+    g.setAttribute('name', 'Vector colors (' + solidEntries.length + ')')
+    solidEntries.forEach(function(e, i) { g.appendChild(buildColorRow(e.original, i, solidEntries)) })
+    content.appendChild(g)
+  }
+  if (imageEntries.length > 0) {
+    const g = document.createElement('fig-group')
+    g.setAttribute('name', 'Image colors (' + imageEntries.length + ')')
+    imageEntries.forEach(function(e, i) { g.appendChild(buildColorRow(e.original, i, imageEntries)) })
+    content.appendChild(g)
+  }
+  document.getElementById('footer').style.display = ''
+  checkChanged()
+}
+function checkChanged() {
+  const changed = solidEntries.some(function(e) { return e.original.toLowerCase() !== e.current.toLowerCase() }) ||
+                  imageEntries.some(function(e) { return e.original.toLowerCase() !== e.current.toLowerCase() })
+  document.getElementById('apply-btn').toggleAttribute('disabled', !changed)
+}
+async function processImageColors(images) {
+  if (images.length === 0) { imageEntries = []; return }
+  const pixelDataList = []
+  for (const { hash, bytes } of images) {
+    const uint8 = new Uint8Array(bytes)
+    const blob = new Blob([uint8], { type: 'image/png' })
+    let bitmap
+    try { bitmap = await createImageBitmap(blob) } catch(e) { continue }
+    const scale = Math.min(1, 150 / Math.max(bitmap.width, bitmap.height))
+    const w = Math.max(1, Math.floor(bitmap.width * scale))
+    const h = Math.max(1, Math.floor(bitmap.height * scale))
+    const canvas = new OffscreenCanvas(w, h)
+    const ctx = canvas.getContext('2d')
+    ctx.drawImage(bitmap, 0, 0, w, h)
+    pixelDataList.push(ctx.getImageData(0, 0, w, h).data)
+  }
+  const colors = quantizeColors(pixelDataList, 8)
+  imageEntries = colors.map(function(c) { const hex = toHex(c.r, c.g, c.b); return { original: hex, current: hex } })
+}
+async function buildModifiedImages(replacements) {
+  const result = []
+  const THRESHOLD = 35
+  for (const { hash, bytes } of loadedImages) {
+    const uint8 = new Uint8Array(bytes)
+    const blob = new Blob([uint8], { type: 'image/png' })
+    let bitmap
+    try { bitmap = await createImageBitmap(blob) } catch(e) { continue }
+    const canvas = new OffscreenCanvas(bitmap.width, bitmap.height)
+    const ctx = canvas.getContext('2d')
+    ctx.drawImage(bitmap, 0, 0)
+    const imgData = ctx.getImageData(0, 0, bitmap.width, bitmap.height)
+    const d = imgData.data
+    let modified = false
+    for (let i = 0; i < d.length; i += 4) {
+      if (d[i+3] < 10) continue
+      const pr = d[i], pg = d[i+1], pb = d[i+2]
+      for (const rep of replacements) {
+        const fr = rep.from.r, fg = rep.from.g, fb = rep.from.b
+        const dist = colorDist(pr, pg, pb, fr, fg, fb)
+        if (dist < THRESHOLD) {
+          const t = Math.max(0, 1 - dist / THRESHOLD)
+          const tr = rep.to.r, tg = rep.to.g, tb = rep.to.b
+          d[i]   = Math.round(pr * (1-t) + tr * t)
+          d[i+1] = Math.round(pg * (1-t) + tg * t)
+          d[i+2] = Math.round(pb * (1-t) + tb * t)
+          modified = true
+          break
+        }
+      }
+    }
+    if (modified) {
+      ctx.putImageData(imgData, 0, 0)
+      const resultBlob = await canvas.convertToBlob({ type: 'image/png' })
+      const resultBytes = Array.from(new Uint8Array(await resultBlob.arrayBuffer()))
+      result.push({ oldHash: hash, bytes: resultBytes })
+    }
+  }
+  return result
+}
+document.getElementById('apply-btn').addEventListener('click', async function() {
+  document.getElementById('apply-btn').setAttribute('disabled', '')
+  document.getElementById('apply-btn').textContent = 'Working…'
+  const solidReplacements = solidEntries
+    .filter(function(e) { return e.original.toLowerCase() !== e.current.toLowerCase() })
+    .map(function(e) { return { from: e.original, to: e.current } })
+  const imageReplacements = imageEntries
+    .filter(function(e) { return e.original.toLowerCase() !== e.current.toLowerCase() })
+    .map(function(e) { return { from: hexToRgb(e.original), to: hexToRgb(e.current) } })
+  let modifiedImages = []
+  if (imageReplacements.length > 0 && loadedImages.length > 0) {
+    modifiedImages = await buildModifiedImages(imageReplacements)
+  }
+  parent.postMessage({ pluginMessage: { type: 'apply', solidReplacements: solidReplacements, modifiedImages: modifiedImages } }, '*')
+  document.getElementById('apply-btn').textContent = 'Apply colors'
+})
+onmessage = async function(event) {
+  const msg = event.data.pluginMessage
+  if (!msg) return
+  if (msg.type === 'no-selection') {
+    showMessage('Select a single layer to scan its colors.')
+    return
+  }
+  if (msg.type === 'error') {
+    showMessage(msg.message)
+    return
+  }
+  if (msg.type === 'scan-result') {
+    solidEntries = (msg.solidColors || []).map(function(hex) { return { original: hex, current: hex } })
+    loadedImages = (msg.images || []).map(function(img) { return { hash: img.hash, bytes: img.bytes } })
+    if (msg.images && msg.images.length > 0) {
+      showLoading('Reading image colors…')
+      await processImageColors(msg.images)
+    } else {
+      imageEntries = []
+    }
+    renderAll()
+  }
+}
+</script>
+</body>
+</html>
