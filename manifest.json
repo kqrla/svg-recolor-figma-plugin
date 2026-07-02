@@ -1,0 +1,11 @@
+{
+  "name": "SVG Recolor",
+  "id": "svg-recolor",
+  "api": "1.0.0",
+  "main": "code.js",
+  "ui": "ui.html",
+  "editorType": ["figma"],
+  "relaunchButtons": [
+    { "command": "svg-recolor", "name": "SVG Recolor" }
+  ]
+}
